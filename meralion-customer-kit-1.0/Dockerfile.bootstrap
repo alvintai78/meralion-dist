@@ -1,0 +1,68 @@
+# Bootstrap GPU image: Python and system libraries only (about 1 GB uncompressed).
+# The ~8 GB Python/CUDA runtime and the model weights are streamed from private
+# Blob in parallel at startup (see model_service/fetch.py), which is much faster
+# than the platform image pull + extraction of an equivalent single image.
+# The default engine is the official meralion-3-asr vLLM 0.16.0 (CUDA 13.0) sidecar;
+# INFERENCE_ENGINE=transformers selects the in-process Transformers fallback.
+FROM vllm/vllm-openai:v0.16.0-x86_64-cu130@sha256:e5cc1e1d812f33abc596779431b55e46a4dbd71cb606805d335f487d17fe123c AS pybase
+
+# The CUDA 13.0 base image provides the forward-compatibility driver libraries.
+FROM nvidia/cuda:13.0.3-base-ubuntu22.04@sha256:73ab6dfb3814a5097cd456736e70650ef9dc72343be4117d0400de78168760fe AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl gcc libc6-dev libsm6 libxext6 libgl1 libnuma1 libibverbs1 \
+    libssl3 libffi8 libbz2-1.0 liblzma5 libsqlite3-0 libreadline8 \
+    libgdbm6 libgdbm-compat4 zlib1g && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=pybase /usr/bin/python3.12 /usr/bin/python3.12
+COPY --from=pybase /usr/lib/python3.12 /usr/lib/python3.12
+COPY --from=pybase /usr/include/python3.12 /usr/include/python3.12
+COPY --from=pybase /usr/include/x86_64-linux-gnu/python3.12 /usr/include/x86_64-linux-gnu/python3.12
+COPY --from=pybase /usr/lib/x86_64-linux-gnu/libpython3.12.so* /usr/lib/x86_64-linux-gnu/
+
+ARG MODEL_ID=MERaLiON/MERaLiON-3-3B-ASR
+ARG MODEL_REVISION=9f226d738dee62c60a2f43b0ab7b9a2585a132c3
+ARG RUNTIME_VERSION
+
+RUN test -n "$RUNTIME_VERSION" && \
+    ln -sf /usr/bin/python3.12 /usr/bin/python3 && \
+    ldconfig && \
+    printf '#include <Python.h>\n' | gcc -I/usr/include/python3.12 -x c -fsyntax-only - && \
+    groupadd --gid 10001 app && \
+    useradd --uid 10001 --gid app --create-home --home-dir /app/home app && \
+    mkdir -p /app/model-cache /tmp/meralion \
+        /usr/local/lib/python3.12/dist-packages /usr/local/bin /usr/local/cuda-13.0 && \
+    ln -sfn /usr/local/cuda-13.0 /usr/local/cuda && \
+    chown -R app:app /app /tmp/meralion \
+        /usr/local/lib/python3.12 /usr/local/bin /usr/local/cuda-13.0
+
+USER app
+WORKDIR /app
+ENV MODEL_ID=${MODEL_ID} \
+    MODEL_REVISION=${MODEL_REVISION} \
+    RUNTIME_VERSION=${RUNTIME_VERSION} \
+    HF_HOME=/app/model-cache \
+    HUGGINGFACE_HUB_CACHE=/app/model-cache/hub \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    CUDA_HOME=/usr/local/cuda \
+    PATH=/app/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
+    TMPDIR=/tmp/meralion \
+    INFERENCE_ENGINE=vllm \
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+    VLLM_NO_USAGE_STATS=1 \
+    DO_NOT_TRACK=1 \
+    WARMUP_TRANSCRIPTION=1
+
+COPY --chown=app:app model_service /app/model_service
+COPY --chown=app:app container/sitecustomize.py /app/sitecustomize.py
+COPY --chown=app:app container/vllm /app/bin/vllm
+
+EXPOSE 8000
+HEALTHCHECK --interval=15s --timeout=5s --start-period=900s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"
+
+ENTRYPOINT ["python3", "-m", "model_service.entrypoint"]

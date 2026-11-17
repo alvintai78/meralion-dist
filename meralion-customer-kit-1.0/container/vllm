@@ -1,0 +1,20 @@
+#!/usr/bin/python3
+"""Start vLLM's OpenAI server directly.
+
+``vllm serve`` first imports every CLI subcommand, including benchmark tooling
+that pulls in several seconds of unrelated imports. Serving needs only the API
+server module, so route the exact same arguments straight to it.
+"""
+
+import runpy
+import sys
+
+# The guard matters: multiprocessing's spawn re-imports this script as __mp_main__.
+if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "serve" and not sys.argv[2].startswith("-"):
+        sys.argv = [sys.argv[0], "--model", sys.argv[2], *sys.argv[3:]]
+        runpy.run_module("vllm.entrypoints.openai.api_server", run_name="__main__")
+    else:
+        from vllm.entrypoints.cli.main import main
+
+        main()
